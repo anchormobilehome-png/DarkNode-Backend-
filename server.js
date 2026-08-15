@@ -92,6 +92,9 @@ const transporter = nodemailer.createTransport({
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS,
   },
+  connectionTimeout: 10000, // give up connecting after 10s instead of hanging
+  greetingTimeout: 10000,
+  socketTimeout: 10000,
 });
 
 async function sendVerificationEmail(email, code) {
@@ -231,13 +234,11 @@ app.post('/api/send-code', codeLimiter, asyncHandler(async (req, res) => {
     return res.json({ message: 'If that account exists, a code has been sent.' });
   }
 
-  try {
-    await issueAndSendCode(email);
-  } catch (err) {
-    console.error('Failed to send verification email:', err.message);
-    return res.status(502).json({ error: 'Could not send the email right now. Try again shortly.' });
-  }
+  // Respond right away instead of waiting on the email itself.
   res.json({ message: 'If that account exists, a code has been sent.' });
+  issueAndSendCode(email).catch((err) => {
+    console.error('Failed to send verification email:', err.message);
+  });
 }));
 
 async function issueAndSendCode(email, purpose = 'email_verification') {
@@ -269,14 +270,16 @@ app.post('/api/forgot-password', codeLimiter, asyncHandler(async (req, res) => {
   if (!email) return res.status(400).json({ error: 'Email is required.' });
 
   const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
-  if (existing.rows.length > 0) {
-    try {
-      await issueAndSendCode(email, 'password_reset');
-    } catch (err) {
-      console.error('Failed to send password reset email:', err.message);
-    }
-  }
+
+  // Respond right away — don't make the user wait on the email itself,
+  // which can be slow or hang if SMTP settings have an issue.
   res.json({ message: 'If that account exists, a reset code has been sent.' });
+
+  if (existing.rows.length > 0) {
+    issueAndSendCode(email, 'password_reset').catch((err) => {
+      console.error('Failed to send password reset email:', err.message);
+    });
+  }
 }));
 
 // =====================================================
