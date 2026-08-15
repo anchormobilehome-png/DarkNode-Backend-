@@ -61,8 +61,10 @@ async function initDb() {
       code_hash TEXT NOT NULL,
       expires_at TIMESTAMPTZ NOT NULL,
       attempts INTEGER NOT NULL DEFAULT 0,
+      purpose TEXT NOT NULL DEFAULT 'email_verification',
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    ALTER TABLE verification_codes ADD COLUMN IF NOT EXISTS purpose TEXT NOT NULL DEFAULT 'email_verification';
 
     CREATE TABLE IF NOT EXISTS scheduled_posts (
       id SERIAL PRIMARY KEY,
@@ -96,6 +98,18 @@ async function sendVerificationEmail(email, code) {
     html: `<p>Your DarkNode verification code is:</p>
            <p style="font-size:28px;font-weight:700;letter-spacing:4px;">${code}</p>
            <p>It expires in 10 minutes. If you didn't request this, you can ignore this email.</p>`,
+  });
+}
+
+async function sendPasswordResetEmail(email, code) {
+  await transporter.sendMail({
+    from: process.env.SMTP_FROM,
+    to: email,
+    subject: 'Reset your DarkNode password',
+    text: `Your DarkNode password reset code is ${code}. It expires in 10 minutes. If you didn't request this, you can safely ignore this email — your password will not be changed.`,
+    html: `<p>Your DarkNode password reset code is:</p>
+           <p style="font-size:28px;font-weight:700;letter-spacing:4px;">${code}</p>
+           <p>It expires in 10 minutes. If you didn't request this, you can safely ignore this email — your password will not be changed.</p>`,
   });
 }
 
@@ -221,19 +235,86 @@ app.post('/api/send-code', codeLimiter, asyncHandler(async (req, res) => {
   res.json({ message: 'If that account exists, a code has been sent.' });
 }));
 
-async function issueAndSendCode(email) {
+async function issueAndSendCode(email, purpose = 'email_verification') {
   const code = generateCode();
   const codeHash = await bcrypt.hash(code, 10);
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
-  await pool.query('DELETE FROM verification_codes WHERE email = $1', [email]);
+  await pool.query('DELETE FROM verification_codes WHERE email = $1 AND purpose = $2', [email, purpose]);
   await pool.query(
-    'INSERT INTO verification_codes (email, code_hash, expires_at) VALUES ($1, $2, $3)',
-    [email, codeHash, expiresAt]
+    'INSERT INTO verification_codes (email, code_hash, expires_at, purpose) VALUES ($1, $2, $3, $4)',
+    [email, codeHash, expiresAt, purpose]
   );
 
-  await sendVerificationEmail(email, code);
+  if (purpose === 'password_reset') {
+    await sendPasswordResetEmail(email, code);
+  } else {
+    await sendVerificationEmail(email, code);
+  }
 }
+
+// =====================================================
+// POST /api/forgot-password
+// Body: { email }
+// Always responds the same way whether or not the email exists,
+// so people can't use this to check which emails are registered.
+// =====================================================
+app.post('/api/forgot-password', codeLimiter, asyncHandler(async (req, res) => {
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ error: 'Email is required.' });
+
+  const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+  if (existing.rows.length > 0) {
+    try {
+      await issueAndSendCode(email, 'password_reset');
+    } catch (err) {
+      console.error('Failed to send password reset email:', err.message);
+    }
+  }
+  res.json({ message: 'If that account exists, a reset code has been sent.' });
+}));
+
+// =====================================================
+// POST /api/reset-password
+// Body: { email, code, newPassword }
+// =====================================================
+app.post('/api/reset-password', asyncHandler(async (req, res) => {
+  const { email, code, newPassword } = req.body || {};
+  if (!email || !code || !newPassword) {
+    return res.status(400).json({ error: 'Email, code and new password are required.' });
+  }
+  if (newPassword.length < 8) {
+    return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+  }
+
+  const result = await pool.query(
+    'SELECT * FROM verification_codes WHERE email = $1 AND purpose = $2',
+    [email, 'password_reset']
+  );
+  const row = result.rows[0];
+  if (!row) return res.status(400).json({ error: 'No pending reset code for this email. Request a new one.' });
+
+  if (new Date(row.expires_at).getTime() < Date.now()) {
+    await pool.query('DELETE FROM verification_codes WHERE id = $1', [row.id]);
+    return res.status(400).json({ error: 'Code expired. Request a new one.' });
+  }
+  if (row.attempts >= 5) {
+    await pool.query('DELETE FROM verification_codes WHERE id = $1', [row.id]);
+    return res.status(429).json({ error: 'Too many incorrect attempts. Request a new code.' });
+  }
+
+  const match = await bcrypt.compare(code, row.code_hash);
+  if (!match) {
+    await pool.query('UPDATE verification_codes SET attempts = attempts + 1 WHERE id = $1', [row.id]);
+    return res.status(400).json({ error: 'Incorrect code.' });
+  }
+
+  const passwordHash = await bcrypt.hash(newPassword, 12);
+  await pool.query('UPDATE users SET password_hash = $1 WHERE email = $2', [passwordHash, email]);
+  await pool.query('DELETE FROM verification_codes WHERE id = $1', [row.id]);
+
+  res.json({ message: 'Password updated. You can now log in with your new password.' });
+}));
 
 // =====================================================
 // POST /api/verify-email
@@ -243,28 +324,31 @@ app.post('/api/verify-email', asyncHandler(async (req, res) => {
   const { email, code } = req.body || {};
   if (!email || !code) return res.status(400).json({ error: 'Email and code are required.' });
 
-  const result = await pool.query('SELECT * FROM verification_codes WHERE email = $1', [email]);
+  const result = await pool.query(
+    'SELECT * FROM verification_codes WHERE email = $1 AND purpose = $2',
+    [email, 'email_verification']
+  );
   const row = result.rows[0];
   if (!row) return res.status(400).json({ error: 'No pending code for this email. Request a new one.' });
 
   if (new Date(row.expires_at).getTime() < Date.now()) {
-    await pool.query('DELETE FROM verification_codes WHERE email = $1', [email]);
+    await pool.query('DELETE FROM verification_codes WHERE id = $1', [row.id]);
     return res.status(400).json({ error: 'Code expired. Request a new one.' });
   }
 
   if (row.attempts >= 5) {
-    await pool.query('DELETE FROM verification_codes WHERE email = $1', [email]);
+    await pool.query('DELETE FROM verification_codes WHERE id = $1', [row.id]);
     return res.status(429).json({ error: 'Too many incorrect attempts. Request a new code.' });
   }
 
   const match = await bcrypt.compare(code, row.code_hash);
   if (!match) {
-    await pool.query('UPDATE verification_codes SET attempts = attempts + 1 WHERE email = $1', [email]);
+    await pool.query('UPDATE verification_codes SET attempts = attempts + 1 WHERE id = $1', [row.id]);
     return res.status(400).json({ error: 'Incorrect code.' });
   }
 
   await pool.query('UPDATE users SET email_verified = TRUE WHERE email = $1', [email]);
-  await pool.query('DELETE FROM verification_codes WHERE email = $1', [email]);
+  await pool.query('DELETE FROM verification_codes WHERE id = $1', [row.id]);
 
   const userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
   const user = userResult.rows[0];
