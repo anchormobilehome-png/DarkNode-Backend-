@@ -158,7 +158,15 @@ app.post('/api/register', async (req, res) => {
   );
   insert.run(name, email, passwordHash);
 
-  await issueAndSendCode(email);
+  try {
+    await issueAndSendCode(email);
+  } catch (err) {
+    console.error('Failed to send verification email:', err.message);
+    return res.status(201).json({
+      message: 'Account created, but the verification email could not be sent. Check the email server settings.',
+      emailFailed: true,
+    });
+  }
 
   res.status(201).json({ message: 'Account created. Check your email for a verification code.' });
 });
@@ -178,7 +186,12 @@ app.post('/api/send-code', codeLimiter, async (req, res) => {
     return res.json({ message: 'If that account exists, a code has been sent.' });
   }
 
-  await issueAndSendCode(email);
+  try {
+    await issueAndSendCode(email);
+  } catch (err) {
+    console.error('Failed to send verification email:', err.message);
+    return res.status(502).json({ error: 'Could not send the email right now. Try again shortly.' });
+  }
   res.json({ message: 'If that account exists, a code has been sent.' });
 });
 
@@ -244,7 +257,11 @@ app.post('/api/login', async (req, res) => {
   if (!match) return res.status(401).json({ error: 'Incorrect email or password.' });
 
   if (!user.email_verified) {
-    await issueAndSendCode(email);
+    try {
+      await issueAndSendCode(email);
+    } catch (err) {
+      console.error('Failed to send verification email:', err.message);
+    }
     return res.status(403).json({
       error: 'Email not verified yet. A new code has been sent.',
       requiresVerification: true,
@@ -314,6 +331,24 @@ app.post('/api/subscription/activate', authMiddleware, async (req, res) => {
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
+
+// Catch-all error handler — makes sure a broken request sends back a normal
+// error response instead of crashing the whole server.
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: 'Something went wrong on the server.' });
+});
+
+// Extra safety net: log unexpected crashes instead of letting the whole
+// process die silently. (This doesn't fix the underlying bug — it just
+// keeps the server running so one bad request can't take everyone down.)
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled promise rejection:', err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
+});
 
 app.listen(PORT, () => {
   console.log(`DarkNode backend listening on port ${PORT}`);
