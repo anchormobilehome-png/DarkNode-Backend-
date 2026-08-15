@@ -9,6 +9,11 @@ const { Pool } = require('pg');
 const crypto = require('crypto');
 
 const app = express();
+
+// Render (and most hosts) sit behind a proxy, so the app needs to trust the
+// first proxy hop to correctly read the real visitor IP. Without this,
+// express-rate-limit throws an error on every request.
+app.set('trust proxy', 1);
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) {
