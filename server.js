@@ -153,22 +153,19 @@ app.post('/api/register', async (req, res) => {
   }
 
   const passwordHash = await bcrypt.hash(password, 12);
+  // NOTE: email_verified is set to 1 immediately — email code verification
+  // is skipped for now since SMTP/email sending isn't fully set up yet.
+  // To turn verification back on later: change this back to 0, and change
+  // handleRegister() in darknode.html to show the verify-code screen again
+  // instead of logging the user straight in.
   const insert = db.prepare(
-    'INSERT INTO users (name, email, password_hash) VALUES (?, ?, ?)'
+    'INSERT INTO users (name, email, password_hash, email_verified) VALUES (?, ?, ?, 1)'
   );
-  insert.run(name, email, passwordHash);
+  const result = insert.run(name, email, passwordHash);
 
-  try {
-    await issueAndSendCode(email);
-  } catch (err) {
-    console.error('Failed to send verification email:', err.message);
-    return res.status(201).json({
-      message: 'Account created, but the verification email could not be sent. Check the email server settings.',
-      emailFailed: true,
-    });
-  }
-
-  res.status(201).json({ message: 'Account created. Check your email for a verification code.' });
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(result.lastInsertRowid);
+  const token = signToken(user);
+  res.status(201).json({ token, user: publicUser(user) });
 });
 
 // =====================================================
@@ -256,18 +253,7 @@ app.post('/api/login', async (req, res) => {
   const match = await bcrypt.compare(password, user.password_hash);
   if (!match) return res.status(401).json({ error: 'Incorrect email or password.' });
 
-  if (!user.email_verified) {
-    try {
-      await issueAndSendCode(email);
-    } catch (err) {
-      console.error('Failed to send verification email:', err.message);
-    }
-    return res.status(403).json({
-      error: 'Email not verified yet. A new code has been sent.',
-      requiresVerification: true,
-    });
-  }
-
+  // Email verification check skipped for now — see note in /api/register.
   const token = signToken(user);
   res.json({ token, user: publicUser(user) });
 });
