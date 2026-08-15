@@ -5,15 +5,18 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
 const rateLimit = require('express-rate-limit');
-const Database = require('better-sqlite3');
+const { Pool } = require('pg');
 const crypto = require('crypto');
-const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) {
   console.error('Missing JWT_SECRET in .env — refusing to start.');
+  process.exit(1);
+}
+if (!process.env.DATABASE_URL) {
+  console.error('Missing DATABASE_URL in .env — refusing to start.');
   process.exit(1);
 }
 
@@ -32,31 +35,36 @@ app.use(
 );
 app.use(express.json());
 
-// ---------- Database ----------
-const db = new Database(path.join(__dirname, 'darknode.db'));
-db.pragma('journal_mode = WAL');
+// ---------- Database (PostgreSQL — a real, permanent database) ----------
+// Unlike the old SQLite file, this data survives every redeploy.
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }, // needed for Render-hosted Postgres
+});
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    email TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    email_verified INTEGER NOT NULL DEFAULT 0,
-    subscribed INTEGER NOT NULL DEFAULT 0,
-    subscription_expires_at TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-  );
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      email TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      email_verified BOOLEAN NOT NULL DEFAULT FALSE,
+      subscribed BOOLEAN NOT NULL DEFAULT FALSE,
+      subscription_expires_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
 
-  CREATE TABLE IF NOT EXISTS verification_codes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    email TEXT NOT NULL,
-    code_hash TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    attempts INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-  );
-`);
+    CREATE TABLE IF NOT EXISTS verification_codes (
+      id SERIAL PRIMARY KEY,
+      email TEXT NOT NULL,
+      code_hash TEXT NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+}
 
 // ---------- Email ----------
 const transporter = nodemailer.createTransport({
@@ -134,11 +142,20 @@ function publicUser(row) {
   };
 }
 
+// Wraps a route handler so any thrown/rejected error is caught and sent
+// back as a normal error response, instead of crashing the whole server.
+function asyncHandler(fn) {
+  return (req, res, next) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+}
+
 // =====================================================
 // POST /api/register
-// Creates the account (unverified) and emails a code.
+// Creates the account and logs the user straight in.
+// (Email verification is currently skipped — see note below.)
 // =====================================================
-app.post('/api/register', async (req, res) => {
+app.post('/api/register', asyncHandler(async (req, res) => {
   const { name, email, password } = req.body || {};
   if (!name || !email || !password) {
     return res.status(400).json({ error: 'Name, email and password are required.' });
@@ -147,38 +164,40 @@ app.post('/api/register', async (req, res) => {
     return res.status(400).json({ error: 'Password must be at least 8 characters.' });
   }
 
-  const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
-  if (existing) {
+  const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+  if (existing.rows.length > 0) {
     return res.status(409).json({ error: 'An account with that email already exists.' });
   }
 
   const passwordHash = await bcrypt.hash(password, 12);
-  // NOTE: email_verified is set to 1 immediately — email code verification
+  // NOTE: email_verified is set to TRUE immediately — email code verification
   // is skipped for now since SMTP/email sending isn't fully set up yet.
-  // To turn verification back on later: change this back to 0, and change
-  // handleRegister() in darknode.html to show the verify-code screen again
-  // instead of logging the user straight in.
-  const insert = db.prepare(
-    'INSERT INTO users (name, email, password_hash, email_verified) VALUES (?, ?, ?, 1)'
+  // To turn verification back on later: change TRUE to FALSE below, and
+  // change handleRegister() in darknode.html to show the verify-code screen
+  // again instead of logging the user straight in.
+  const result = await pool.query(
+    `INSERT INTO users (name, email, password_hash, email_verified)
+     VALUES ($1, $2, $3, TRUE)
+     RETURNING *`,
+    [name, email, passwordHash]
   );
-  const result = insert.run(name, email, passwordHash);
 
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(result.lastInsertRowid);
+  const user = result.rows[0];
   const token = signToken(user);
   res.status(201).json({ token, user: publicUser(user) });
-});
+}));
 
 // =====================================================
 // POST /api/send-code
 // (Re)sends a verification code to an email — used for
 // resend, or for login-time verification if not yet verified.
 // =====================================================
-app.post('/api/send-code', codeLimiter, async (req, res) => {
+app.post('/api/send-code', codeLimiter, asyncHandler(async (req, res) => {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'Email is required.' });
 
-  const user = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
-  if (!user) {
+  const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+  if (existing.rows.length === 0) {
     // Don't reveal whether the email exists.
     return res.json({ message: 'If that account exists, a code has been sent.' });
   }
@@ -190,17 +209,18 @@ app.post('/api/send-code', codeLimiter, async (req, res) => {
     return res.status(502).json({ error: 'Could not send the email right now. Try again shortly.' });
   }
   res.json({ message: 'If that account exists, a code has been sent.' });
-});
+}));
 
 async function issueAndSendCode(email) {
   const code = generateCode();
   const codeHash = await bcrypt.hash(code, 10);
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
-  db.prepare('DELETE FROM verification_codes WHERE email = ?').run(email);
-  db.prepare(
-    'INSERT INTO verification_codes (email, code_hash, expires_at) VALUES (?, ?, ?)'
-  ).run(email, codeHash, expiresAt);
+  await pool.query('DELETE FROM verification_codes WHERE email = $1', [email]);
+  await pool.query(
+    'INSERT INTO verification_codes (email, code_hash, expires_at) VALUES ($1, $2, $3)',
+    [email, codeHash, expiresAt]
+  );
 
   await sendVerificationEmail(email, code);
 }
@@ -209,45 +229,48 @@ async function issueAndSendCode(email) {
 // POST /api/verify-email
 // Body: { email, code }
 // =====================================================
-app.post('/api/verify-email', async (req, res) => {
+app.post('/api/verify-email', asyncHandler(async (req, res) => {
   const { email, code } = req.body || {};
   if (!email || !code) return res.status(400).json({ error: 'Email and code are required.' });
 
-  const row = db.prepare('SELECT * FROM verification_codes WHERE email = ?').get(email);
+  const result = await pool.query('SELECT * FROM verification_codes WHERE email = $1', [email]);
+  const row = result.rows[0];
   if (!row) return res.status(400).json({ error: 'No pending code for this email. Request a new one.' });
 
   if (new Date(row.expires_at).getTime() < Date.now()) {
-    db.prepare('DELETE FROM verification_codes WHERE email = ?').run(email);
+    await pool.query('DELETE FROM verification_codes WHERE email = $1', [email]);
     return res.status(400).json({ error: 'Code expired. Request a new one.' });
   }
 
   if (row.attempts >= 5) {
-    db.prepare('DELETE FROM verification_codes WHERE email = ?').run(email);
+    await pool.query('DELETE FROM verification_codes WHERE email = $1', [email]);
     return res.status(429).json({ error: 'Too many incorrect attempts. Request a new code.' });
   }
 
   const match = await bcrypt.compare(code, row.code_hash);
   if (!match) {
-    db.prepare('UPDATE verification_codes SET attempts = attempts + 1 WHERE email = ?').run(email);
+    await pool.query('UPDATE verification_codes SET attempts = attempts + 1 WHERE email = $1', [email]);
     return res.status(400).json({ error: 'Incorrect code.' });
   }
 
-  db.prepare('UPDATE users SET email_verified = 1 WHERE email = ?').run(email);
-  db.prepare('DELETE FROM verification_codes WHERE email = ?').run(email);
+  await pool.query('UPDATE users SET email_verified = TRUE WHERE email = $1', [email]);
+  await pool.query('DELETE FROM verification_codes WHERE email = $1', [email]);
 
-  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+  const userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+  const user = userResult.rows[0];
   const token = signToken(user);
   res.json({ token, user: publicUser(user) });
-});
+}));
 
 // =====================================================
 // POST /api/login
 // =====================================================
-app.post('/api/login', async (req, res) => {
+app.post('/api/login', asyncHandler(async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: 'Email and password are required.' });
 
-  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+  const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+  const user = result.rows[0];
   if (!user) return res.status(401).json({ error: 'Incorrect email or password.' });
 
   const match = await bcrypt.compare(password, user.password_hash);
@@ -256,16 +279,17 @@ app.post('/api/login', async (req, res) => {
   // Email verification check skipped for now — see note in /api/register.
   const token = signToken(user);
   res.json({ token, user: publicUser(user) });
-});
+}));
 
 // =====================================================
 // GET /api/me  (requires Bearer token)
 // =====================================================
-app.get('/api/me', authMiddleware, (req, res) => {
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.sub);
+app.get('/api/me', authMiddleware, asyncHandler(async (req, res) => {
+  const result = await pool.query('SELECT * FROM users WHERE id = $1', [req.user.sub]);
+  const user = result.rows[0];
   if (!user) return res.status(404).json({ error: 'User not found.' });
   res.json({ user: publicUser(user) });
-});
+}));
 
 // =====================================================
 // POST /api/subscription/activate
@@ -274,13 +298,13 @@ app.get('/api/me', authMiddleware, (req, res) => {
 // using the secret key) before marking the account subscribed.
 // This does NOT trust the frontend callback alone.
 // =====================================================
-app.post('/api/subscription/activate', authMiddleware, async (req, res) => {
+app.post('/api/subscription/activate', authMiddleware, asyncHandler(async (req, res) => {
   const { reference } = req.body || {};
   if (!reference) {
     return res.status(400).json({ error: 'Missing reference.' });
   }
 
-  try{
+  try {
     const verifyRes = await fetch(
       `https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`,
       {
@@ -304,17 +328,18 @@ app.post('/api/subscription/activate', authMiddleware, async (req, res) => {
     }
 
     const expires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
-    db.prepare(
-      'UPDATE users SET subscribed = 1, subscription_expires_at = ? WHERE id = ?'
-    ).run(expires, req.user.sub);
+    await pool.query(
+      'UPDATE users SET subscribed = TRUE, subscription_expires_at = $1 WHERE id = $2',
+      [expires, req.user.sub]
+    );
 
-    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.sub);
-    res.json({ user: publicUser(user) });
-  }catch(err){
+    const result = await pool.query('SELECT * FROM users WHERE id = $1', [req.user.sub]);
+    res.json({ user: publicUser(result.rows[0]) });
+  } catch (err) {
     console.error('Paystack verify error:', err);
     res.status(502).json({ error: 'Could not reach payment verification service.' });
   }
-});
+}));
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
@@ -327,8 +352,7 @@ app.use((err, req, res, next) => {
 });
 
 // Extra safety net: log unexpected crashes instead of letting the whole
-// process die silently. (This doesn't fix the underlying bug — it just
-// keeps the server running so one bad request can't take everyone down.)
+// process die silently.
 process.on('unhandledRejection', (err) => {
   console.error('Unhandled promise rejection:', err);
 });
@@ -336,6 +360,13 @@ process.on('uncaughtException', (err) => {
   console.error('Uncaught exception:', err);
 });
 
-app.listen(PORT, () => {
-  console.log(`DarkNode backend listening on port ${PORT}`);
-});
+initDb()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`DarkNode backend listening on port ${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error('Failed to set up database:', err);
+    process.exit(1);
+  });
