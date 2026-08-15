@@ -63,6 +63,16 @@ async function initDb() {
       attempts INTEGER NOT NULL DEFAULT 0,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+
+    CREATE TABLE IF NOT EXISTS scheduled_posts (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      platform TEXT NOT NULL,
+      caption TEXT NOT NULL,
+      scheduled_at TIMESTAMPTZ NOT NULL,
+      status TEXT NOT NULL DEFAULT 'scheduled',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
   `);
 }
 
@@ -339,6 +349,87 @@ app.post('/api/subscription/activate', authMiddleware, asyncHandler(async (req, 
     console.error('Paystack verify error:', err);
     res.status(502).json({ error: 'Could not reach payment verification service.' });
   }
+}));
+
+// =====================================================
+// CONTENT SCHEDULING
+// Only subscribed users can use these — checked via
+// requireSubscription below.
+// =====================================================
+async function requireSubscription(req, res, next) {
+  const result = await pool.query('SELECT subscribed FROM users WHERE id = $1', [req.user.sub]);
+  const user = result.rows[0];
+  if (!user || !user.subscribed) {
+    return res.status(403).json({ error: 'An active subscription is required.' });
+  }
+  next();
+}
+
+function publicPost(row) {
+  return {
+    id: row.id,
+    platform: row.platform,
+    caption: row.caption,
+    scheduledAt: row.scheduled_at,
+    status: row.status,
+    createdAt: row.created_at,
+  };
+}
+
+// GET /api/posts?platform=instagram
+// Lists the logged-in user's scheduled posts, optionally filtered by platform.
+app.get('/api/posts', authMiddleware, requireSubscription, asyncHandler(async (req, res) => {
+  const { platform } = req.query;
+  let result;
+  if (platform) {
+    result = await pool.query(
+      'SELECT * FROM scheduled_posts WHERE user_id = $1 AND platform = $2 ORDER BY scheduled_at ASC',
+      [req.user.sub, platform]
+    );
+  } else {
+    result = await pool.query(
+      'SELECT * FROM scheduled_posts WHERE user_id = $1 ORDER BY scheduled_at ASC',
+      [req.user.sub]
+    );
+  }
+  res.json({ posts: result.rows.map(publicPost) });
+}));
+
+// POST /api/posts
+// Body: { platform, caption, scheduledAt }
+app.post('/api/posts', authMiddleware, requireSubscription, asyncHandler(async (req, res) => {
+  const { platform, caption, scheduledAt } = req.body || {};
+  if (!platform || !caption || !scheduledAt) {
+    return res.status(400).json({ error: 'platform, caption and scheduledAt are required.' });
+  }
+  if (caption.length > 2000) {
+    return res.status(400).json({ error: 'Caption is too long (max 2000 characters).' });
+  }
+  const when = new Date(scheduledAt);
+  if (isNaN(when.getTime())) {
+    return res.status(400).json({ error: 'scheduledAt must be a valid date/time.' });
+  }
+
+  const result = await pool.query(
+    `INSERT INTO scheduled_posts (user_id, platform, caption, scheduled_at)
+     VALUES ($1, $2, $3, $4)
+     RETURNING *`,
+    [req.user.sub, platform, caption, when.toISOString()]
+  );
+  res.status(201).json({ post: publicPost(result.rows[0]) });
+}));
+
+// DELETE /api/posts/:id
+app.delete('/api/posts/:id', authMiddleware, requireSubscription, asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const result = await pool.query(
+    'DELETE FROM scheduled_posts WHERE id = $1 AND user_id = $2 RETURNING id',
+    [id, req.user.sub]
+  );
+  if (result.rows.length === 0) {
+    return res.status(404).json({ error: 'Post not found.' });
+  }
+  res.json({ deleted: true });
 }));
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
