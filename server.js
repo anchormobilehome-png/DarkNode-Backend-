@@ -525,9 +525,9 @@ app.get('/api/posts', authMiddleware, requireSubscription, asyncHandler(async (r
 }));
 
 // POST /api/posts
-// Body: { platform, caption, scheduledAt }
+// Body: { platform, caption, scheduledAt, status } — status defaults to 'scheduled', can be 'draft'
 app.post('/api/posts', authMiddleware, requireSubscription, asyncHandler(async (req, res) => {
-  const { platform, caption, scheduledAt } = req.body || {};
+  const { platform, caption, scheduledAt, status } = req.body || {};
   if (!platform || !caption || !scheduledAt) {
     return res.status(400).json({ error: 'platform, caption and scheduledAt are required.' });
   }
@@ -538,14 +538,54 @@ app.post('/api/posts', authMiddleware, requireSubscription, asyncHandler(async (
   if (isNaN(when.getTime())) {
     return res.status(400).json({ error: 'scheduledAt must be a valid date/time.' });
   }
+  const safeStatus = status === 'draft' ? 'draft' : 'scheduled';
 
   const result = await pool.query(
-    `INSERT INTO scheduled_posts (user_id, platform, caption, scheduled_at)
-     VALUES ($1, $2, $3, $4)
+    `INSERT INTO scheduled_posts (user_id, platform, caption, scheduled_at, status)
+     VALUES ($1, $2, $3, $4, $5)
      RETURNING *`,
-    [req.user.sub, platform, caption, when.toISOString()]
+    [req.user.sub, platform, caption, when.toISOString(), safeStatus]
   );
   res.status(201).json({ post: publicPost(result.rows[0]) });
+}));
+
+// PATCH /api/posts/:id
+// Body: any of { caption, scheduledAt, status } — updates only what's provided.
+// Used for both editing a post and toggling draft <-> scheduled.
+app.patch('/api/posts/:id', authMiddleware, requireSubscription, asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const { caption, scheduledAt, status } = req.body || {};
+
+  const existing = await pool.query(
+    'SELECT * FROM scheduled_posts WHERE id = $1 AND user_id = $2',
+    [id, req.user.sub]
+  );
+  if (existing.rows.length === 0) {
+    return res.status(404).json({ error: 'Post not found.' });
+  }
+
+  const current = existing.rows[0];
+  const newCaption = caption !== undefined ? caption : current.caption;
+  const newScheduledAt = scheduledAt !== undefined ? new Date(scheduledAt) : new Date(current.scheduled_at);
+  const newStatus = status !== undefined ? status : current.status;
+
+  if (newCaption.length > 2000) {
+    return res.status(400).json({ error: 'Caption is too long (max 2000 characters).' });
+  }
+  if (isNaN(newScheduledAt.getTime())) {
+    return res.status(400).json({ error: 'scheduledAt must be a valid date/time.' });
+  }
+  if (!['draft', 'scheduled', 'published', 'failed'].includes(newStatus)) {
+    return res.status(400).json({ error: 'Invalid status.' });
+  }
+
+  const result = await pool.query(
+    `UPDATE scheduled_posts SET caption = $1, scheduled_at = $2, status = $3
+     WHERE id = $4 AND user_id = $5
+     RETURNING *`,
+    [newCaption, newScheduledAt.toISOString(), newStatus, id, req.user.sub]
+  );
+  res.json({ post: publicPost(result.rows[0]) });
 }));
 
 // DELETE /api/posts/:id
@@ -586,9 +626,9 @@ app.post('/api/generate-caption', authMiddleware, requireSubscription, asyncHand
     const prompt = `You write short social media captions for ${platform || 'social media'}. Write captions for a post about: ${topic.trim()}
 
 Respond with ONLY valid JSON, no other text, in this exact shape:
-{"captions":[{"text":"...","hashtags":["#tag1","#tag2"]},{"text":"...","hashtags":["#tag1","#tag2"]},{"text":"...","hashtags":["#tag1","#tag2"]}]}
+{"captions":[{"style":"Professional","text":"...","hashtags":["#tag1","#tag2"],"cta":"..."},{"style":"Engaging","text":"...","hashtags":["#tag1","#tag2"],"cta":"..."},{"style":"Short & direct","text":"...","hashtags":["#tag1","#tag2"],"cta":"..."}]}
 
-Give exactly 3 distinct caption options with different tones (one punchy, one warm/personal, one informative). Each caption text should be 1-3 sentences, no hashtags inside the text itself. 3-5 relevant hashtags per option.`;
+Give exactly those 3 caption options in that order. "Professional" is polished and businesslike. "Engaging" is warm, conversational, inviting interaction. "Short & direct" is brief and to the point. Each caption text should be 1-3 sentences (shorter for "Short & direct"), no hashtags inside the text itself. 3-5 relevant hashtags per option. "cta" is a short call-to-action phrase (e.g. "Book now", "DM to order", "Tap the link in bio") relevant to the topic.`;
 
     const geminiRes = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
@@ -631,6 +671,28 @@ Give exactly 3 distinct caption options with different tones (one punchy, one wa
   } finally {
     clearTimeout(timeout);
   }
+}));
+
+// =====================================================
+// POST /api/social/:platform/connect
+// Honest placeholder — DarkNode does not yet have official
+// developer approval from any of these platforms, so this can
+// never claim a real connection succeeded. It's here so the
+// frontend has a real endpoint to call, and returns a clear,
+// accurate message instead of faking a successful connection.
+// When real OAuth credentials for a platform are set up, replace
+// this platform's branch with the actual authorization redirect.
+// =====================================================
+app.post('/api/social/:platform/connect', authMiddleware, requireSubscription, asyncHandler(async (req, res) => {
+  const { platform } = req.params;
+  const known = ['instagram', 'facebook', 'snapchat', 'tiktok'];
+  if (!known.includes(platform)) {
+    return res.status(404).json({ error: 'Unknown platform.' });
+  }
+  res.status(501).json({
+    error: `Official account connection for ${platform} isn't set up yet — this requires developer approval from the platform, which DarkNode hasn't completed.`,
+    notImplemented: true,
+  });
 }));
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
