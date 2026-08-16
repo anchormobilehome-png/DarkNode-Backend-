@@ -3,7 +3,6 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const nodemailer = require('nodemailer');
 const rateLimit = require('express-rate-limit');
 const { Pool } = require('pg');
 const crypto = require('crypto');
@@ -83,23 +82,49 @@ async function initDb() {
   `);
 }
 
-// ---------- Email ----------
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: Number(process.env.SMTP_PORT || 587),
-  secure: false, // true for port 465
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-  },
-  connectionTimeout: 10000, // give up connecting after 10s instead of hanging
-  greetingTimeout: 10000,
-  socketTimeout: 10000,
-});
+// ---------- Email (via Brevo's HTTP API) ----------
+// NOTE: We use Brevo's REST API instead of SMTP because Render's free tier
+// blocks all outbound SMTP ports (25, 465, 587) as an anti-spam measure —
+// this is a platform-level block, not something fixable with SMTP settings.
+// Brevo sends over regular HTTPS (port 443), which isn't blocked.
+async function sendEmail({ to, subject, text, html }) {
+  const apiKey = process.env.BREVO_API_KEY;
+  const senderEmail = process.env.BREVO_SENDER_EMAIL;
+  if (!apiKey || !senderEmail) {
+    throw new Error('Email is not configured (missing BREVO_API_KEY or BREVO_SENDER_EMAIL).');
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+
+  try {
+    const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: {
+        'api-key': apiKey,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({
+        sender: { email: senderEmail, name: 'DarkNode' },
+        to: [{ email: to }],
+        subject,
+        textContent: text,
+        htmlContent: html,
+      }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`Brevo send failed (${res.status}): ${body}`);
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 async function sendVerificationEmail(email, code) {
-  await transporter.sendMail({
-    from: process.env.SMTP_FROM,
+  await sendEmail({
     to: email,
     subject: 'Your DarkNode verification code',
     text: `Your DarkNode verification code is ${code}. It expires in 10 minutes. If you didn't request this, ignore this email.`,
@@ -110,8 +135,7 @@ async function sendVerificationEmail(email, code) {
 }
 
 async function sendPasswordResetEmail(email, code) {
-  await transporter.sendMail({
-    from: process.env.SMTP_FROM,
+  await sendEmail({
     to: email,
     subject: 'Reset your DarkNode password',
     text: `Your DarkNode password reset code is ${code}. It expires in 10 minutes. If you didn't request this, you can safely ignore this email — your password will not be changed.`,
@@ -163,13 +187,23 @@ function authMiddleware(req, res, next) {
   }
 }
 
+// A user only counts as actively subscribed if the "subscribed" flag is set
+// AND their subscription hasn't passed its expiry date. This is checked
+// fresh every time (not just once at payment) so access actually turns off
+// automatically 30 days after payment, instead of staying unlocked forever.
+function isSubscriptionActive(row) {
+  if (!row.subscribed) return false;
+  if (!row.subscription_expires_at) return false;
+  return new Date(row.subscription_expires_at).getTime() > Date.now();
+}
+
 function publicUser(row) {
   return {
     id: row.id,
     name: row.name,
     email: row.email,
     emailVerified: !!row.email_verified,
-    subscribed: !!row.subscribed,
+    subscribed: isSubscriptionActive(row),
     subscriptionExpiresAt: row.subscription_expires_at,
   };
 }
@@ -449,9 +483,12 @@ app.post('/api/subscription/activate', authMiddleware, asyncHandler(async (req, 
 // requireSubscription below.
 // =====================================================
 async function requireSubscription(req, res, next) {
-  const result = await pool.query('SELECT subscribed FROM users WHERE id = $1', [req.user.sub]);
+  const result = await pool.query(
+    'SELECT subscribed, subscription_expires_at FROM users WHERE id = $1',
+    [req.user.sub]
+  );
   const user = result.rows[0];
-  if (!user || !user.subscribed) {
+  if (!user || !isSubscriptionActive(user)) {
     return res.status(403).json({ error: 'An active subscription is required.' });
   }
   next();
@@ -522,6 +559,78 @@ app.delete('/api/posts/:id', authMiddleware, requireSubscription, asyncHandler(a
     return res.status(404).json({ error: 'Post not found.' });
   }
   res.json({ deleted: true });
+}));
+
+// =====================================================
+// POST /api/generate-caption
+// Body: { platform, topic }
+// Uses Google's free Gemini API to generate caption + hashtag ideas.
+// Requires an active subscription, same as scheduling.
+// =====================================================
+app.post('/api/generate-caption', authMiddleware, requireSubscription, asyncHandler(async (req, res) => {
+  const { platform, topic } = req.body || {};
+  if (!topic || !topic.trim()) {
+    return res.status(400).json({ error: 'Describe what the post is about first.' });
+  }
+  if (topic.length > 300) {
+    return res.status(400).json({ error: 'Keep the description under 300 characters.' });
+  }
+  if (!process.env.GEMINI_API_KEY) {
+    return res.status(503).json({ error: 'AI captions are not configured yet.' });
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+
+  try {
+    const prompt = `You write short social media captions for ${platform || 'social media'}. Write captions for a post about: ${topic.trim()}
+
+Respond with ONLY valid JSON, no other text, in this exact shape:
+{"captions":[{"text":"...","hashtags":["#tag1","#tag2"]},{"text":"...","hashtags":["#tag1","#tag2"]},{"text":"...","hashtags":["#tag1","#tag2"]}]}
+
+Give exactly 3 distinct caption options with different tones (one punchy, one warm/personal, one informative). Each caption text should be 1-3 sentences, no hashtags inside the text itself. 3-5 relevant hashtags per option.`;
+
+    const geminiRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: {
+            temperature: 0.8,
+            maxOutputTokens: 600,
+            responseMimeType: 'application/json',
+          },
+        }),
+        signal: controller.signal,
+      }
+    );
+
+    if (!geminiRes.ok) {
+      const body = await geminiRes.text().catch(() => '');
+      console.error('Gemini API error:', geminiRes.status, body);
+      return res.status(502).json({ error: 'Could not generate captions right now. Try again shortly.' });
+    }
+
+    const data = await geminiRes.json();
+    const raw = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return res.status(502).json({ error: 'Got an unexpected response. Try again.' });
+    }
+
+    res.json({ captions: parsed.captions || [] });
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      return res.status(504).json({ error: 'That took too long. Try again.' });
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
 }));
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
