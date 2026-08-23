@@ -44,6 +44,17 @@ app.use(express.json());
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }, // needed for Render-hosted Postgres
+  max: 10,                      // max simultaneous connections
+  idleTimeoutMillis: 30000,     // release unused connections after 30s
+  connectionTimeoutMillis: 8000, // give up trying to connect after 8s instead of hanging
+});
+
+// CRITICAL: without this handler, a dropped/idle database connection
+// (which happens more often under real traffic) crashes the ENTIRE
+// server — this is a Node.js/pg gotcha, not something obvious. This
+// alone could explain a server going down right as ad traffic hit.
+pool.on('error', (err) => {
+  console.error('Unexpected database pool error (recovered, not crashing):', err.message);
 });
 
 async function initDb() {
@@ -153,7 +164,7 @@ function generateCode() {
 // ---------- Rate limiting ----------
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  limit: 20,
+  limit: 150, // generous — many real customers share one IP via mobile carrier NAT
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -235,7 +246,7 @@ app.post('/api/register', asyncHandler(async (req, res) => {
     return res.status(409).json({ error: 'An account with that email already exists.' });
   }
 
-  const passwordHash = await bcrypt.hash(password, 12);
+  const passwordHash = await bcrypt.hash(password, 10);
   // NOTE: email_verified is set to TRUE immediately — email code verification
   // is skipped for now since SMTP/email sending isn't fully set up yet.
   // To turn verification back on later: change TRUE to FALSE below, and
@@ -351,7 +362,7 @@ app.post('/api/reset-password', asyncHandler(async (req, res) => {
     return res.status(400).json({ error: 'Incorrect code.' });
   }
 
-  const passwordHash = await bcrypt.hash(newPassword, 12);
+  const passwordHash = await bcrypt.hash(newPassword, 10);
   await pool.query('UPDATE users SET password_hash = $1 WHERE email = $2', [passwordHash, email]);
   await pool.query('DELETE FROM verification_codes WHERE id = $1', [row.id]);
 
